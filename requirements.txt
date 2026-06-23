@@ -1,0 +1,6 @@
+cryptography>=42.0
+flask>=3.0
+gunicorn>=22.0
+prometheus-client>=0.20
+pyyaml>=6.0
+requests>=2.31

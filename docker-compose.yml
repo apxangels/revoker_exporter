@@ -1,0 +1,22 @@
+services:
+  revoker_exporter:
+    image: apxangels/revoker_exporter:1.0
+    container_name: revoker_exporter
+    ports:
+      - "9969:9969"
+
+    restart: unless-stopped
+
+    volumes:
+      - ./revoker.yaml:/app/revoker.yaml:ro
+
+    environment:
+      TZ: Europe/Moscow
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9969/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

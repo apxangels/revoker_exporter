@@ -1,0 +1,15 @@
+port: 9969
+max_workers: 10
+
+# How often to re-check revocation status
+refresh_ocsp_seconds: 3600   # 1 hour
+refresh_crl_seconds: 21600   # 6 hours (also bounded by CRL next_update)
+refresh_error_seconds: 300   # 5 minutes after any failure
+
+# Network timeouts (seconds)
+connect_timeout: 10
+http_timeout: 15
+
+# How long the /probe endpoint will block waiting for the first check result.
+# Set to 0 to return immediately (legacy PENDING behaviour).
+probe_wait_timeout: 120
