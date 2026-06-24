@@ -229,8 +229,9 @@ def fetch_leaf_cert(
         ctx.check_hostname = True
         ctx.verify_mode = ssl.CERT_REQUIRED
 
-    timeout = _cfg().connect_timeout
-    with socket.create_connection((host, port), timeout=timeout) as raw:
+    c = _cfg()
+    with socket.create_connection((host, port), timeout=c.connect_timeout) as raw:
+        raw.settimeout(c.http_timeout)   # TLS handshake gets its own, longer timeout
         with ctx.wrap_socket(raw, server_hostname=host) as tls:
             der = tls.getpeercert(binary_form=True)
             stapled = False  # Python ssl does not expose raw stapled bytes
@@ -788,12 +789,14 @@ def probe():
     module_name = flask_request.args.get("module", "default").strip()
     debug = flask_request.args.get("debug", "").lower() in ("1", "true", "yes")
 
-    # Strip scheme if provided (e.g. https://ya.ru → ya.ru)
+    # Strip scheme if provided (e.g. https://ya.ru/path → ya.ru/path)
     for scheme in ("https://", "http://"):
         if target.startswith(scheme):
             target = target[len(scheme):]
             break
-    target = target.rstrip("/")
+
+    # Strip path: ya.ru/check → ya.ru  (we only need host[:port])
+    target = target.split("/", 1)[0]
 
     # Parse host:port
     if target.startswith("["):
