@@ -2,8 +2,8 @@
 """
 TLS certificate revocation Prometheus exporter.
 
-Active OCSP checks with CRL fallback. All network I/O happens in background
-workers; the /probe endpoint blocks on first check and reads from cache thereafter.
+Active OCSP/CRL checks with per-module configuration (mode + insecure).
+The /probe endpoint blocks on first check and reads from cache thereafter.
 """
 
 import os
@@ -30,7 +30,7 @@ from cryptography.x509.oid import ExtensionOID, AuthorityInformationAccessOID, N
 from cryptography.x509 import ocsp as crypto_ocsp
 from cryptography.x509.ocsp import OCSPCertStatus, OCSPResponseStatus
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,30 +38,85 @@ logging.basicConfig(
 )
 logger = logging.getLogger("revoker")
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
-def _load_config(path: str = "revoker.yaml") -> dict:
+CONFIG_PATH = os.environ.get("REVOKER_CONFIG", "revoker.yaml")
+
+
+@dataclass
+class ModuleConfig:
+    mode: str = "both"      # "ocsp" | "crl" | "both"
+    insecure: bool = False
+
+
+@dataclass
+class AppConfig:
+    refresh_ocsp_seconds: int = 3600
+    refresh_crl_seconds: int = 21600
+    refresh_error_seconds: int = 300
+    connect_timeout: int = 10
+    http_timeout: int = 15
+    max_workers: int = 10
+    port: int = 9969
+    probe_wait_timeout: int = 120
+    modules: Dict[str, ModuleConfig] = field(default_factory=dict)
+
+
+def _load_raw(path: str) -> dict:
     try:
         with open(path) as f:
-            cfg = yaml.safe_load(f) or {}
-        logger.info(f"Loaded config from {path}")
-        return cfg
+            return yaml.safe_load(f) or {}
     except FileNotFoundError:
-        logger.info(f"{path} not found, using defaults")
+        logger.info("%s not found, using defaults", path)
         return {}
 
-_cfg = _load_config()
 
-REFRESH_OCSP_SECONDS  = int(_cfg.get("refresh_ocsp_seconds",  3600))
-REFRESH_CRL_SECONDS   = int(_cfg.get("refresh_crl_seconds",  21600))
-REFRESH_ERROR_SECONDS = int(_cfg.get("refresh_error_seconds",   300))
-CONNECT_TIMEOUT       = int(_cfg.get("connect_timeout",          10))
-HTTP_TIMEOUT          = int(_cfg.get("http_timeout",             15))
-MAX_WORKERS           = int(_cfg.get("max_workers",              10))
-PORT                  = int(_cfg.get("port",                   9969))
-PROBE_WAIT_TIMEOUT    = int(_cfg.get("probe_wait_timeout",      120))
+def _parse_config(raw: dict) -> AppConfig:
+    modules: Dict[str, ModuleConfig] = {}
+    for name, mc in (raw.get("modules") or {}).items():
+        mc = mc or {}
+        modules[name] = ModuleConfig(
+            mode=str(mc.get("mode", "both")),
+            insecure=bool(mc.get("insecure", False)),
+        )
+    if "default" not in modules:
+        modules["default"] = ModuleConfig()
 
-# ── Status codes ───────────────────────────────────────────────────────────────
+    return AppConfig(
+        refresh_ocsp_seconds  = int(raw.get("refresh_ocsp_seconds",  3600)),
+        refresh_crl_seconds   = int(raw.get("refresh_crl_seconds",  21600)),
+        refresh_error_seconds = int(raw.get("refresh_error_seconds",   300)),
+        connect_timeout       = int(raw.get("connect_timeout",          10)),
+        http_timeout          = int(raw.get("http_timeout",             15)),
+        max_workers           = int(raw.get("max_workers",              10)),
+        port                  = int(raw.get("port",                   9969)),
+        probe_wait_timeout    = int(raw.get("probe_wait_timeout",      120)),
+        modules               = modules,
+    )
+
+
+_config_lock: threading.Lock = threading.Lock()
+_config: AppConfig = _parse_config(_load_raw(CONFIG_PATH))
+logger.info("Loaded config from %s", CONFIG_PATH)
+
+
+def _cfg() -> AppConfig:
+    with _config_lock:
+        return _config
+
+
+def reload_config() -> str:
+    global _config
+    raw = _load_raw(CONFIG_PATH)
+    new_cfg = _parse_config(raw)
+    with _config_lock:
+        _config = new_cfg
+    names = ", ".join(sorted(new_cfg.modules))
+    logger.info("Config reloaded: %d module(s): %s", len(new_cfg.modules), names)
+    return f"reloaded {len(new_cfg.modules)} module(s): {names}"
+
+
+# ── Status codes ──────────────────────────────────────────────────────────────
 
 class RevStatus(IntEnum):
     GOOD        = 0  # certificate is valid
@@ -72,7 +127,8 @@ class RevStatus(IntEnum):
     ERROR       = 5  # parse or validation error
     PENDING     = 6  # first check not yet complete
 
-# ── Data classes ───────────────────────────────────────────────────────────────
+
+# ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
 class RevResult:
@@ -100,6 +156,7 @@ class CertInfo:
 @dataclass
 class TargetState:
     instance: str
+    module_name: str
     last_checked: Optional[float] = None
     next_refresh_at: float = 0.0
     cert_info: Optional[CertInfo] = None
@@ -109,12 +166,13 @@ class TargetState:
     ready: threading.Event = field(default_factory=threading.Event)
 
 
-# ── Global state ───────────────────────────────────────────────────────────────
+# ── Global state ──────────────────────────────────────────────────────────────
 
 _lock: threading.Lock = threading.Lock()
 _state: Dict[str, TargetState] = {}
+
 _pool = concurrent.futures.ThreadPoolExecutor(
-    max_workers=MAX_WORKERS,
+    max_workers=_config.max_workers,
     thread_name_prefix="checker",
 )
 
@@ -122,12 +180,11 @@ _pool = concurrent.futures.ThreadPoolExecutor(
 _crl_cache: Dict[str, Tuple[x509.CertificateRevocationList, float]] = {}
 _crl_cache_lock = threading.Lock()
 
-# ── Datetime helpers ───────────────────────────────────────────────────────────
+
+# ── Datetime helpers ──────────────────────────────────────────────────────────
 
 def _utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _cert_not_after(cert: x509.Certificate) -> datetime:
@@ -151,21 +208,35 @@ def _crl_next_update(crl: x509.CertificateRevocationList) -> Optional[datetime]:
         nu = crl.next_update                 # type: ignore[attr-defined]
         return _utc(nu) if nu else None
 
-# ── Certificate / chain helpers ────────────────────────────────────────────────
 
-def fetch_leaf_cert(host: str, port: int) -> Tuple[x509.Certificate, bool]:
-    """Connect via TLS and return (leaf_cert, ocsp_stapled)."""
+# ── Certificate / chain helpers ───────────────────────────────────────────────
+
+def fetch_leaf_cert(
+    host: str,
+    port: int,
+    insecure: bool = False,
+) -> Tuple[x509.Certificate, bool]:
+    """Connect via TLS and return (leaf_cert, ocsp_stapled).
+
+    When insecure=True the SSL chain is not verified — useful for targets
+    whose issuer certificate is absent from the local CA bundle.
+    """
     ctx = ssl.create_default_context()
-    ctx.check_hostname = True
-    ctx.verify_mode = ssl.CERT_REQUIRED
+    if insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    else:
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
 
-    with socket.create_connection((host, port), timeout=CONNECT_TIMEOUT) as raw:
+    timeout = _cfg().connect_timeout
+    with socket.create_connection((host, port), timeout=timeout) as raw:
         with ctx.wrap_socket(raw, server_hostname=host) as tls:
             der = tls.getpeercert(binary_form=True)
             stapled = False  # Python ssl does not expose raw stapled bytes
 
     cert = x509.load_der_x509_certificate(der, default_backend())
-    logger.debug(f"[{host}:{port}] leaf cert: {cert.subject.rfc4514_string()}")
+    logger.debug("[%s:%s] leaf cert: %s", host, port, cert.subject.rfc4514_string())
     return cert, stapled
 
 
@@ -212,14 +283,14 @@ def get_crl_urls(cert: x509.Certificate) -> List[str]:
 def fetch_issuer_cert(url: str) -> Optional[x509.Certificate]:
     """Download the CA Issuers certificate (DER or PEM) from an AIA URL."""
     try:
-        r = requests.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        r = requests.get(url, timeout=_cfg().http_timeout, allow_redirects=True)
         r.raise_for_status()
         try:
             return x509.load_der_x509_certificate(r.content, default_backend())
         except Exception:
             return x509.load_pem_x509_certificate(r.content, default_backend())
     except Exception as e:
-        logger.warning(f"issuer cert fetch failed ({url}): {e}")
+        logger.warning("issuer cert fetch failed (%s): %s", url, e)
         return None
 
 
@@ -282,7 +353,8 @@ def _cert_chain_labels(cert: x509.Certificate, chain_no: int, instance: str) -> 
         "ips":       ips,
     }
 
-# ── OCSP ───────────────────────────────────────────────────────────────────────
+
+# ── OCSP ──────────────────────────────────────────────────────────────────────
 
 def check_ocsp(
     cert: x509.Certificate,
@@ -304,7 +376,7 @@ def check_ocsp(
             ocsp_url,
             data=req_der,
             headers={"Content-Type": "application/ocsp-request"},
-            timeout=HTTP_TIMEOUT,
+            timeout=_cfg().http_timeout,
         )
         latency = time.monotonic() - t0
         r.raise_for_status()
@@ -312,7 +384,7 @@ def check_ocsp(
         resp = crypto_ocsp.load_der_ocsp_response(r.content)
 
         if resp.response_status != OCSPResponseStatus.SUCCESSFUL:
-            logger.warning(f"[{instance}] OCSP non-successful: {resp.response_status}")
+            logger.warning("[%s] OCSP non-successful: %s", instance, resp.response_status)
             return RevResult(
                 status=RevStatus.UNKNOWN,
                 method="ocsp",
@@ -335,39 +407,24 @@ def check_ocsp(
         next_update = _utc(resp.next_update) if resp.next_update else None
 
         if this_update and this_update > now:
-            logger.warning(f"[{instance}] OCSP this_update is in the future")
+            logger.warning("[%s] OCSP this_update is in the future", instance)
         if next_update and next_update < now:
-            logger.warning(f"[{instance}] OCSP response is stale (next_update={next_update})")
+            logger.warning("[%s] OCSP response is stale (next_update=%s)", instance, next_update)
 
         cert_status = resp.certificate_status
         if cert_status == OCSPCertStatus.GOOD:
-            logger.info(f"[{instance}] OCSP: GOOD (latency={latency:.3f}s)")
-            return RevResult(
-                status=RevStatus.GOOD,
-                method="ocsp",
-                revoked=False,
-                ocsp_latency=latency,
-            )
+            logger.info("[%s] OCSP: GOOD (latency=%.3fs)", instance, latency)
+            return RevResult(status=RevStatus.GOOD, method="ocsp", revoked=False, ocsp_latency=latency)
         elif cert_status == OCSPCertStatus.REVOKED:
-            logger.warning(f"[{instance}] OCSP: REVOKED")
-            return RevResult(
-                status=RevStatus.REVOKED,
-                method="ocsp",
-                revoked=True,
-                ocsp_latency=latency,
-            )
+            logger.warning("[%s] OCSP: REVOKED", instance)
+            return RevResult(status=RevStatus.REVOKED, method="ocsp", revoked=True, ocsp_latency=latency)
         else:
-            logger.warning(f"[{instance}] OCSP: UNKNOWN status")
-            return RevResult(
-                status=RevStatus.UNKNOWN,
-                method="ocsp",
-                revoked=False,
-                ocsp_latency=latency,
-            )
+            logger.warning("[%s] OCSP: UNKNOWN status", instance)
+            return RevResult(status=RevStatus.UNKNOWN, method="ocsp", revoked=False, ocsp_latency=latency)
 
     except Exception as e:
         latency = time.monotonic() - t0
-        logger.warning(f"[{instance}] OCSP failed ({ocsp_url}): {e}")
+        logger.warning("[%s] OCSP failed (%s): %s", instance, ocsp_url, e)
         return RevResult(
             status=RevStatus.UNREACHABLE,
             method="ocsp",
@@ -376,7 +433,8 @@ def check_ocsp(
             error=str(e),
         )
 
-# ── CRL ────────────────────────────────────────────────────────────────────────
+
+# ── CRL ───────────────────────────────────────────────────────────────────────
 
 def _load_crl(data: bytes) -> x509.CertificateRevocationList:
     try:
@@ -395,25 +453,25 @@ def _fetch_crl(url: str, instance: str) -> Optional[x509.CertificateRevocationLi
     if entry is not None:
         crl, expiry_ts = entry
         if now_ts < expiry_ts:
-            logger.debug(f"[{instance}] CRL cache hit: {url}")
+            logger.debug("[%s] CRL cache hit: %s", instance, url)
             return crl
-        logger.debug(f"[{instance}] CRL cache expired: {url}")
+        logger.debug("[%s] CRL cache expired: %s", instance, url)
 
-    logger.info(f"[{instance}] downloading CRL: {url}")
+    logger.info("[%s] downloading CRL: %s", instance, url)
     try:
-        r = requests.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        r = requests.get(url, timeout=_cfg().http_timeout, allow_redirects=True)
         r.raise_for_status()
         crl = _load_crl(r.content)
 
         next_update = _crl_next_update(crl)
-        expiry_ts = next_update.timestamp() if next_update else (now_ts + REFRESH_CRL_SECONDS)
+        refresh_crl = _cfg().refresh_crl_seconds
+        expiry_ts = next_update.timestamp() if next_update else (now_ts + refresh_crl)
 
         with _crl_cache_lock:
             _crl_cache[url] = (crl, expiry_ts)
-
         return crl
     except Exception as e:
-        logger.warning(f"[{instance}] CRL download failed ({url}): {e}")
+        logger.warning("[%s] CRL download failed (%s): %s", instance, url, e)
         return None
 
 
@@ -440,11 +498,11 @@ def check_crl(
 
         next_update = _crl_next_update(crl)
         if next_update and next_update < now:
-            logger.warning(f"[{instance}] CRL is stale (next_update={next_update})")
+            logger.warning("[%s] CRL is stale (next_update=%s)", instance, next_update)
 
         revoked_entry = crl.get_revoked_certificate_by_serial_number(serial)
         if revoked_entry:
-            logger.warning(f"[{instance}] CRL: REVOKED")
+            logger.warning("[%s] CRL: REVOKED", instance)
             return RevResult(
                 status=RevStatus.REVOKED,
                 method="crl",
@@ -453,7 +511,7 @@ def check_crl(
                 crl_issuer=crl.issuer.rfc4514_string(),
             )
 
-        logger.info(f"[{instance}] CRL: GOOD")
+        logger.info("[%s] CRL: GOOD", instance)
         return RevResult(
             status=RevStatus.GOOD,
             method="crl",
@@ -469,33 +527,44 @@ def check_crl(
         error="all CRL URLs failed",
     )
 
-# ── Full check ─────────────────────────────────────────────────────────────────
+
+# ── Full check ────────────────────────────────────────────────────────────────
 
 def _next_refresh(result: RevResult) -> float:
     now = time.time()
+    c = _cfg()
     if result.status in (RevStatus.UNREACHABLE, RevStatus.ERROR):
-        return now + REFRESH_ERROR_SECONDS
+        return now + c.refresh_error_seconds
     if result.method == "crl" and result.crl_next_update:
         valid_for = (result.crl_next_update - datetime.now(timezone.utc)).total_seconds()
-        return now + max(REFRESH_CRL_SECONDS, valid_for / 2)
-    return now + REFRESH_OCSP_SECONDS
+        return now + max(c.refresh_crl_seconds, valid_for / 2)
+    return now + c.refresh_ocsp_seconds
 
 
-def run_check(instance: str) -> None:
-    """Full revocation check for one target. Runs in the thread pool."""
+def run_check(state_key: str) -> None:
+    """Full revocation check for one target+module. Runs in the thread pool."""
+    with _lock:
+        st = _state.get(state_key)
+        if st is None:
+            return
+        instance    = st.instance
+        module_name = st.module_name
+
+    module = _cfg().modules.get(module_name, ModuleConfig())
     host, _, port_str = instance.rpartition(":")
     port = int(port_str)
 
-    logger.info(f"[{instance}] starting check")
+    logger.info(
+        "[%s] starting check (module=%s mode=%s insecure=%s)",
+        instance, module_name, module.mode, module.insecure,
+    )
     ready_event: Optional[threading.Event] = None
 
     try:
-        cert, stapled = fetch_leaf_cert(host, port)
+        cert, stapled = fetch_leaf_cert(host, port, insecure=module.insecure)
 
         ocsp_urls, issuer_url = get_aia_urls(cert)
         crl_urls = get_crl_urls(cert)
-
-        # Build the full chain via AIA CA Issuers (leaf → intermediate → root)
         chain = build_cert_chain(cert)
 
         cert_info = CertInfo(
@@ -510,34 +579,34 @@ def run_check(instance: str) -> None:
         )
 
         result: Optional[RevResult] = None
+        mode = module.mode
 
-        # ── OCSP (primary) ─────────────────────────────────────────────────
-        if ocsp_urls:
-            # Reuse chain[1] as the issuer if we have it; avoids a second fetch
-            issuer = chain[1] if len(chain) > 1 else None
-            if issuer is None:
-                if issuer_url:
+        # ── OCSP (primary for mode=ocsp or mode=both) ─────────────────────
+        if mode in ("ocsp", "both"):
+            if ocsp_urls:
+                issuer = chain[1] if len(chain) > 1 else None
+                if issuer is None and issuer_url:
                     issuer = fetch_issuer_cert(issuer_url)
+                if issuer is None:
+                    logger.warning("[%s] no issuer cert; OCSP skipped", instance)
                 else:
-                    logger.warning(f"[{instance}] no CA Issuers URL; OCSP skipped")
+                    for url in ocsp_urls:
+                        result = check_ocsp(cert, issuer, url, instance)
+                        if result.status not in (RevStatus.UNREACHABLE, RevStatus.ERROR):
+                            break
+            else:
+                logger.info("[%s] no OCSP URLs in certificate", instance)
 
-            if issuer:
-                for url in ocsp_urls:
-                    result = check_ocsp(cert, issuer, url, instance)
-                    if result.status not in (RevStatus.UNREACHABLE, RevStatus.ERROR):
-                        break
-        else:
-            logger.info(f"[{instance}] no OCSP URLs in certificate")
-
-        # ── CRL (fallback) ─────────────────────────────────────────────────
-        if result is None or result.status in (
-            RevStatus.UNREACHABLE, RevStatus.UNKNOWN, RevStatus.ERROR
-        ):
-            if crl_urls:
+        # ── CRL (primary for mode=crl, fallback for mode=both) ────────────
+        if mode in ("crl", "both"):
+            need_crl = (
+                mode == "crl"
+                or result is None
+                or result.status in (RevStatus.UNREACHABLE, RevStatus.UNKNOWN, RevStatus.ERROR)
+            )
+            if need_crl and crl_urls:
                 crl_result = check_crl(cert, crl_urls, instance)
-                if result is None or crl_result.status in (
-                    RevStatus.GOOD, RevStatus.REVOKED
-                ):
+                if result is None or crl_result.status in (RevStatus.GOOD, RevStatus.REVOKED):
                     result = crl_result
 
         if result is None:
@@ -549,7 +618,7 @@ def run_check(instance: str) -> None:
             )
 
         with _lock:
-            st = _state.get(instance)
+            st = _state.get(state_key)
             if st:
                 st.cert_info = cert_info
                 st.result = result
@@ -557,20 +626,18 @@ def run_check(instance: str) -> None:
                 st.next_refresh_at = _next_refresh(result)
                 st.running = False
                 if result.status in (RevStatus.UNREACHABLE, RevStatus.ERROR):
-                    st.failures[result.method] = (
-                        st.failures.get(result.method, 0) + 1
-                    )
+                    st.failures[result.method] = st.failures.get(result.method, 0) + 1
                 ready_event = st.ready
 
         logger.info(
-            f"[{instance}] done: status={result.status.name} "
-            f"method={result.method} revoked={result.revoked}"
+            "[%s] done: status=%s method=%s revoked=%s",
+            instance, result.status.name, result.method, result.revoked,
         )
 
     except Exception as e:
-        logger.exception(f"[{instance}] check failed: {e}")
+        logger.exception("[%s] check failed: %s", instance, e)
         with _lock:
-            st = _state.get(instance)
+            st = _state.get(state_key)
             if st:
                 st.result = RevResult(
                     status=RevStatus.ERROR,
@@ -579,7 +646,7 @@ def run_check(instance: str) -> None:
                     error=str(e),
                 )
                 st.last_checked = time.time()
-                st.next_refresh_at = time.time() + REFRESH_ERROR_SECONDS
+                st.next_refresh_at = time.time() + _cfg().refresh_error_seconds
                 st.running = False
                 st.failures["connect"] = st.failures.get("connect", 0) + 1
                 ready_event = st.ready
@@ -588,20 +655,22 @@ def run_check(instance: str) -> None:
         ready_event.set()
 
 
-def _ensure_target(instance: str) -> threading.Event:
-    """Register target, schedule a check if due, and return its ready event."""
+def _ensure_target(instance: str, module_name: str) -> Tuple[str, threading.Event]:
+    """Register target+module, schedule a check if due, return (state_key, ready_event)."""
+    state_key = f"{module_name}:{instance}"
     with _lock:
-        if instance not in _state:
-            _state[instance] = TargetState(instance=instance)
+        if state_key not in _state:
+            _state[state_key] = TargetState(instance=instance, module_name=module_name)
 
-        st = _state[instance]
+        st = _state[state_key]
         if not st.running and time.time() >= st.next_refresh_at:
             st.running = True
-            _pool.submit(run_check, instance)
+            _pool.submit(run_check, state_key)
 
-        return st.ready
+        return state_key, st.ready
 
-# ── Background scheduler ───────────────────────────────────────────────────────
+
+# ── Background scheduler ──────────────────────────────────────────────────────
 
 def _scheduler_loop() -> None:
     while True:
@@ -610,18 +679,104 @@ def _scheduler_loop() -> None:
             items = list(_state.items())
 
         now = time.time()
-        for instance, st in items:
+        to_run: List[str] = []
+        for state_key, st in items:
             if not st.running and now >= st.next_refresh_at:
                 with _lock:
-                    _state[instance].running = True
-                _pool.submit(run_check, instance)
+                    st2 = _state.get(state_key)
+                    if st2 and not st2.running and now >= st2.next_refresh_at:
+                        st2.running = True
+                        to_run.append(state_key)
+
+        for state_key in to_run:
+            _pool.submit(run_check, state_key)
 
 
 threading.Thread(target=_scheduler_loop, daemon=True, name="scheduler").start()
 
-# ── Flask application ──────────────────────────────────────────────────────────
+
+# ── Flask application ─────────────────────────────────────────────────────────
 
 app = Flask(__name__)
+
+_INDEX_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Revoker Exporter</title>
+  <style>
+    body {{ font-family: sans-serif; margin: 2rem; max-width: 720px; color: #222; }}
+    h1 {{ margin-bottom: 1.2rem; }}
+    label {{ display: block; margin: 0.4rem 0; }}
+    input[type=text] {{ width: 360px; padding: 0.3em 0.5em; font-size: 1em; }}
+    select {{ padding: 0.3em 0.5em; font-size: 1em; }}
+    #links {{ margin-top: 1.2rem; line-height: 2; }}
+    #links a {{ display: block; }}
+    hr {{ margin: 1.5rem 0; border: none; border-top: 1px solid #ccc; }}
+    .nav a {{ margin-right: 1.2rem; }}
+  </style>
+</head>
+<body>
+<h1>Revoker Exporter</h1>
+<form onsubmit="return false;">
+  <label>Target: <input type="text" id="target" value="prometheus.io:443" oninput="update()"></label>
+  <label>Module:
+    <select id="module" onchange="update()">
+      {module_options}
+    </select>
+  </label>
+</form>
+<div id="links">
+  <a id="probe-link" href="#">Probe …</a>
+  <a id="debug-link" href="#">Debug probe …</a>
+</div>
+<hr>
+<p class="nav">
+  <a href="/targets">Active targets</a>
+  <a href="/config">Configuration</a>
+</p>
+<script>
+  function update() {{
+    var t = document.getElementById('target').value.trim() || 'prometheus.io:443';
+    var m = document.getElementById('module').value;
+    var base = '/probe?target=' + encodeURIComponent(t) + '&module=' + encodeURIComponent(m);
+    document.getElementById('probe-link').href = base;
+    document.getElementById('probe-link').textContent = 'Probe ' + t + ' with ' + m;
+    document.getElementById('debug-link').href = base + '&debug=true';
+    document.getElementById('debug-link').textContent = 'Debug probe ' + t + ' with ' + m;
+  }}
+  update();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index():
+    modules = sorted(_cfg().modules.keys())
+    opts = "\n      ".join(
+        f'<option value="{m}"{" selected" if m == "default" else ""}>{m}</option>'
+        for m in modules
+    )
+    return Response(_INDEX_HTML.format(module_options=opts), mimetype="text/html")
+
+
+@app.route("/config")
+def config_page():
+    try:
+        with open(CONFIG_PATH) as f:
+            content = f.read()
+    except Exception as e:
+        content = f"# error reading {CONFIG_PATH}: {e}\n"
+    return Response(content, mimetype="text/plain; charset=utf-8")
+
+
+@app.route("/reload", methods=["POST"])
+def do_reload():
+    msg = reload_config()
+    return Response(msg + "\n", mimetype="text/plain")
 
 
 @app.route("/probe")
@@ -629,6 +784,9 @@ def probe():
     target = flask_request.args.get("target", "").strip()
     if not target:
         return Response("missing ?target= parameter\n", status=400)
+
+    module_name = flask_request.args.get("module", "default").strip()
+    debug = flask_request.args.get("debug", "").lower() in ("1", "true", "yes")
 
     # Strip scheme if provided (e.g. https://ya.ru → ya.ru)
     for scheme in ("https://", "http://"):
@@ -656,15 +814,21 @@ def probe():
         port = 443
 
     instance = f"{host}:{port}"
-    ready_event = _ensure_target(instance)
+
+    c = _cfg()
+    if module_name not in c.modules:
+        return Response(f"unknown module {module_name!r}\n", status=400)
+
+    state_key, ready_event = _ensure_target(instance, module_name)
 
     # Block until the first check completes (avoids returning PENDING to Prometheus)
-    if PROBE_WAIT_TIMEOUT > 0 and not ready_event.is_set():
-        ready_event.wait(timeout=PROBE_WAIT_TIMEOUT)
+    probe_wait = c.probe_wait_timeout
+    if probe_wait > 0 and not ready_event.is_set():
+        ready_event.wait(timeout=probe_wait)
 
     # Snapshot cached state — no I/O under lock
     with _lock:
-        st = _state[instance]
+        st = _state[state_key]
         cert_info    = st.cert_info
         result       = st.result
         last_checked = st.last_checked
@@ -746,14 +910,10 @@ def probe():
         g_days.labels(**lbl).set(days)
         g_stapled.labels(**lbl).set(1 if cert_info.stapled else 0)
 
-        for cert_obj in cert_info.chain:
-            chain_labels = _cert_chain_labels(cert_obj, 0, instance)
-            g_chain_not_after.labels(**chain_labels).set(
-                _cert_not_after(cert_obj).timestamp()
-            )
-            g_chain_not_before.labels(**chain_labels).set(
-                _cert_not_before(cert_obj).timestamp()
-            )
+        for i, cert_obj in enumerate(cert_info.chain):
+            chain_labels = _cert_chain_labels(cert_obj, i, instance)
+            g_chain_not_after.labels(**chain_labels).set(_cert_not_after(cert_obj).timestamp())
+            g_chain_not_before.labels(**chain_labels).set(_cert_not_before(cert_obj).timestamp())
 
     if last_checked is not None:
         g_cache_age.labels(**lbl).set(time.time() - last_checked)
@@ -761,10 +921,36 @@ def probe():
     for method, count in failures.items():
         g_failures.labels(instance=instance, method=method).set(count)
 
-    return Response(
-        generate_latest(registry),
-        mimetype="text/plain; version=0.0.4",
-    )
+    metrics_bytes = generate_latest(registry)
+
+    if debug:
+        module = c.modules.get(module_name, ModuleConfig())
+        lines = [
+            f"# module:      {module_name} (mode={module.mode}, insecure={module.insecure})",
+            f"# instance:    {instance}",
+        ]
+        if result:
+            lines.append(f"# status:      {result.status.name}")
+            lines.append(f"# method:      {result.method}")
+            lines.append(f"# revoked:     {result.revoked}")
+            if result.error:
+                lines.append(f"# error:       {result.error}")
+        if cert_info:
+            lines.append(f"# subject:     {cert_info.subject}")
+            lines.append(f"# not_after:   {cert_info.not_after.isoformat()}")
+            lines.append(f"# ocsp_urls:   {cert_info.ocsp_urls}")
+            lines.append(f"# crl_urls:    {cert_info.crl_urls}")
+        if last_checked:
+            ts = datetime.fromtimestamp(last_checked, tz=timezone.utc).isoformat()
+            lines.append(f"# last_checked:{ts}")
+        lines.append("")
+        debug_prefix = ("\n".join(lines) + "\n").encode()
+        return Response(
+            debug_prefix + metrics_bytes,
+            mimetype="text/plain; version=0.0.4",
+        )
+
+    return Response(metrics_bytes, mimetype="text/plain; version=0.0.4")
 
 
 @app.route("/healthz")
@@ -777,15 +963,15 @@ def targets():
     """Debug endpoint: list registered targets and their current status."""
     with _lock:
         rows = []
-        for inst, st in sorted(_state.items()):
+        for state_key, st in sorted(_state.items()):
             status = st.result.status.name if st.result else "PENDING"
             checked = (
                 datetime.fromtimestamp(st.last_checked, tz=timezone.utc).isoformat()
                 if st.last_checked else "never"
             )
-            rows.append(f"{inst}\t{status}\t{checked}")
+            rows.append(f"{st.instance}\t{st.module_name}\t{status}\t{checked}")
     return Response("\n".join(rows) + "\n", mimetype="text/plain")
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    app.run(host="0.0.0.0", port=_config.port, threaded=True)

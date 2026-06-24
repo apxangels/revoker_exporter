@@ -7,9 +7,44 @@ refresh_crl_seconds: 21600   # 6 hours (also bounded by CRL next_update)
 refresh_error_seconds: 300   # 5 minutes after any failure
 
 # Network timeouts (seconds)
-connect_timeout: 10
-http_timeout: 15
+connect_timeout: 30
+http_timeout: 30
 
 # How long the /probe endpoint will block waiting for the first check result.
 # Set to 0 to return immediately (legacy PENDING behaviour).
 probe_wait_timeout: 120
+
+# Modules define check behaviour. Select via ?module=<name> in /probe requests.
+#
+# mode:
+#   both  — OCSP primary, CRL fallback (default)
+#   ocsp  — OCSP only, no CRL fallback
+#   crl   — CRL only, no OCSP
+#
+# insecure:
+#   false — verify TLS certificate chain (default)
+#   true  — skip chain verification (use when issuer CA is absent from local bundle)
+modules:
+  default:
+    mode: both
+    insecure: false
+
+  insecure:
+    mode: both
+    insecure: true
+
+  ocsp_only:
+    mode: ocsp
+    insecure: false
+
+  crl_only:
+    mode: crl
+    insecure: false
+
+  insecure_ocsp:
+    mode: ocsp
+    insecure: true
+
+  insecure_crl:
+    mode: crl
+    insecure: true

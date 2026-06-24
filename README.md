@@ -74,6 +74,22 @@ connect_timeout: 10           # TLS connect timeout in seconds
 http_timeout: 15              # OCSP / CRL / AIA fetch timeout in seconds
 
 probe_wait_timeout: 120       # how long /probe blocks waiting for the first result
+
+# Modules define check behaviour. Select via ?module=<name> in /probe requests.
+#
+# mode:
+#   both  — OCSP primary, CRL fallback (default)
+#   ocsp  — OCSP only, no CRL fallback
+#   crl   — CRL only, no OCSP
+#
+# insecure:
+#   false — verify TLS certificate chain (default)
+#   true  — skip chain verification (use when issuer CA is absent from local bundle)
+modules:
+  default:
+    mode: both
+    insecure: false
+
 ```
 
 ## Running
@@ -130,6 +146,8 @@ volumes:
 scrape_configs:
   - job_name: tls_revocation
     metrics_path: /probe
+    params:
+      module: ["default"]
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
