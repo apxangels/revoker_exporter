@@ -164,6 +164,7 @@ class TargetState:
     next_refresh_at: float = 0.0
     cert_info: Optional[CertInfo] = None
     result: Optional[RevResult] = None
+    per_method: Dict[str, "RevResult"] = field(default_factory=dict)
     running: bool = False
     failures: Dict[str, int] = field(default_factory=dict)
     ready: threading.Event = field(default_factory=threading.Event)
@@ -607,10 +608,11 @@ def run_check(state_key: str) -> None:
             chain=chain,
         )
 
-        result: Optional[RevResult] = None
+        ocsp_result: Optional[RevResult] = None
+        crl_result: Optional[RevResult] = None
         mode = module.mode
 
-        # ── OCSP (primary for mode=ocsp or mode=both) ─────────────────────
+        # ── OCSP ──────────────────────────────────────────────────────────
         if mode in ("ocsp", "both"):
             if ocsp_urls:
                 issuer = chain[1] if len(chain) > 1 else None
@@ -620,24 +622,51 @@ def run_check(state_key: str) -> None:
                     logger.warning("[%s] no issuer cert; OCSP skipped", instance)
                 else:
                     for url in ocsp_urls:
-                        result = check_ocsp(cert, issuer, url, instance)
-                        if result.status not in (RevStatus.UNREACHABLE, RevStatus.ERROR):
+                        ocsp_result = check_ocsp(cert, issuer, url, instance)
+                        if ocsp_result.status not in (RevStatus.UNREACHABLE, RevStatus.ERROR):
                             break
             else:
                 logger.info("[%s] no OCSP URLs in certificate", instance)
 
-        # ── CRL (primary for mode=crl, fallback for mode=both) ────────────
+        # ── CRL ───────────────────────────────────────────────────────────
+        # In mode=both always run CRL so both method metrics are populated.
         if mode in ("crl", "both"):
-            need_crl = (
-                mode == "crl"
-                or result is None
-                or result.status in (RevStatus.UNREACHABLE, RevStatus.UNKNOWN, RevStatus.ERROR)
-            )
-            if need_crl and crl_urls:
+            if crl_urls:
                 crl_result = check_crl(cert, crl_urls, instance)
-                if result is None or crl_result.status in (RevStatus.GOOD, RevStatus.REVOKED):
-                    result = crl_result
+            else:
+                logger.info("[%s] no CRL URLs in certificate", instance)
 
+        # ── Pick winning result ────────────────────────────────────────────
+        # In mode=both CRL is authoritative: prefer CRL definitive result,
+        # fall back to OCSP only when CRL is unavailable/unreachable.
+        _definitive = (RevStatus.GOOD, RevStatus.REVOKED)
+        _bad = (RevStatus.UNREACHABLE, RevStatus.ERROR, RevStatus.UNAVAILABLE)
+        if mode == "both":
+            if crl_result and crl_result.status in _definitive:
+                result = crl_result
+            elif ocsp_result and ocsp_result.status in _definitive:
+                result = ocsp_result
+            elif crl_result and crl_result.status not in _bad:
+                result = crl_result
+            elif ocsp_result:
+                result = ocsp_result
+            elif crl_result:
+                result = crl_result
+            else:
+                result = None
+        else:
+            if ocsp_result and ocsp_result.status in _definitive:
+                result = ocsp_result
+            elif crl_result and crl_result.status in _definitive:
+                result = crl_result
+            elif ocsp_result and ocsp_result.status not in _bad:
+                result = ocsp_result
+            elif crl_result:
+                result = crl_result
+            elif ocsp_result:
+                result = ocsp_result
+            else:
+                result = None
         if result is None:
             result = RevResult(
                 status=RevStatus.UNAVAILABLE,
@@ -646,11 +675,18 @@ def run_check(state_key: str) -> None:
                 error="no OCSP or CRL URLs found in certificate",
             )
 
+        per_method: Dict[str, RevResult] = {}
+        if ocsp_result is not None:
+            per_method["ocsp"] = ocsp_result
+        if crl_result is not None:
+            per_method["crl"] = crl_result
+
         with _lock:
             st = _state.get(state_key)
             if st:
                 st.cert_info = cert_info
                 st.result = result
+                st.per_method = per_method
                 st.last_checked = time.time()
                 st.next_refresh_at = _next_refresh(result)
                 st.running = False
@@ -826,14 +862,19 @@ def probe():
     # Strip path: ya.ru/check → ya.ru  (we only need host[:port])
     target = target.split("/", 1)[0]
 
-    # Parse host:port
+    # Parse host and track whether a port was explicitly given
+    port: Optional[int] = None
     if target.startswith("["):
         bracket_end = target.find("]")
         if bracket_end == -1:
             return Response("invalid IPv6 target\n", status=400)
         host = target[1:bracket_end]
         rest = target[bracket_end + 1:]
-        port = int(rest.lstrip(":")) if rest.startswith(":") else 443
+        if rest.startswith(":"):
+            try:
+                port = int(rest[1:])
+            except ValueError:
+                return Response("invalid port\n", status=400)
     elif ":" in target:
         host, _, port_str = target.rpartition(":")
         try:
@@ -842,23 +883,14 @@ def probe():
             return Response("invalid port\n", status=400)
     else:
         host = target
-        port = 443
 
     c = _cfg()
     if module_name not in c.modules:
         return Response(f"unknown module {module_name!r}\n", status=400)
 
     module = c.modules[module_name]
-    default_port = 25 if module.proto == "smtp" else 443
-
-    # Apply default port if none was specified in target
-    if target.startswith("["):
-        bracket_end = target.find("]")
-        rest = target[bracket_end + 1:] if bracket_end != -1 else ""
-        if not rest.startswith(":"):
-            port = default_port
-    elif ":" not in target:
-        port = default_port
+    if port is None:
+        port = 25 if module.proto == "smtp" else 443
 
     instance = f"{host}:{port}"
 
@@ -874,6 +906,7 @@ def probe():
         st = _state[state_key]
         cert_info    = st.cert_info
         result       = st.result
+        per_method   = dict(st.per_method)
         last_checked = st.last_checked
         failures     = dict(st.failures)
 
@@ -932,13 +965,20 @@ def probe():
 
     if result is not None:
         g_revoked.labels(**lbl).set(1 if result.revoked else 0)
-        g_status.labels(instance=instance, method=result.method).set(int(result.status))
+        # Emit per-method status rows (ocsp + crl when both were tried)
+        if per_method:
+            for meth, mres in per_method.items():
+                g_status.labels(instance=instance, method=meth).set(int(mres.status))
+        else:
+            g_status.labels(instance=instance, method=result.method).set(int(result.status))
 
-        if result.ocsp_latency is not None:
-            g_ocsp_lat.labels(**lbl).set(result.ocsp_latency)
+        ocsp_r = per_method.get("ocsp") or result
+        if ocsp_r.ocsp_latency is not None:
+            g_ocsp_lat.labels(**lbl).set(ocsp_r.ocsp_latency)
 
-        if result.crl_next_update is not None:
-            g_crl_next.labels(**lbl).set(result.crl_next_update.timestamp())
+        crl_res = per_method.get("crl") or result
+        if crl_res.crl_next_update is not None:
+            g_crl_next.labels(**lbl).set(crl_res.crl_next_update.timestamp())
 
         definitive = result.status in (RevStatus.GOOD, RevStatus.REVOKED)
         g_success.labels(**lbl).set(1 if definitive else 0)

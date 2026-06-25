@@ -16,14 +16,24 @@ probe_wait_timeout: 120
 
 # Modules define check behaviour. Select via ?module=<name> in /probe requests.
 #
+# proto:
+#   tcp   — plain TLS handshake (default); default port 443
+#   smtp  — SMTP STARTTLS on port 25 (default port 25, override with host:port)
+#
 # mode:
-#   both  — OCSP primary, CRL fallback (default)
-#   ocsp  — OCSP only, no CRL fallback
+#   both  — СRL primary, OSCP fallback (default)
+#   ocsp  — OCSP only, no CRL 
 #   crl   — CRL only, no OCSP
 #
 # insecure:
 #   false — verify TLS certificate chain (default)
 #   true  — skip chain verification (use when issuer CA is absent from local bundle)
+#
+# Target formats accepted by /probe:
+#   host             →  port from module default (443 tcp / 25 smtp)
+#   host:port        →  explicit port, overrides module default
+#   host/path        →  path is stripped, only host is used
+#   https://host/p   →  scheme and path are stripped
 modules:
   default:
     mode: both
@@ -48,3 +58,23 @@ modules:
   insecure_crl:
     mode: crl
     insecure: true
+
+  smtp:
+    proto: smtp
+    mode: both
+    insecure: false
+
+  smtp_insecure:
+    proto: smtp
+    mode: both
+    insecure: true
+
+  smtp_ocsp:
+    proto: smtp
+    mode: ocsp
+    insecure: false
+
+  smtp_crl:
+    proto: smtp
+    mode: crl
+    insecure: false

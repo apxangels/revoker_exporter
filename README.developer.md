@@ -39,7 +39,8 @@ _state: Dict[str, TargetState]
 One `TargetState` entry per target (e.g. `"ya.ru:443"`). Contains:
 
 - `cert_info` — parsed certificate data and the full chain
-- `result` — last `RevResult` (status code, method, latency, etc.)
+- `result` — winning `RevResult` used for `tls_cert_revoked` and `tls_probe_success`
+- `per_method` — `Dict[str, RevResult]` with one entry per method that was actually checked (keys: `"ocsp"`, `"crl"`); used to emit per-method `tls_revocation_status` rows
 - `last_checked` — unix timestamp of the last completed check
 - `next_refresh_at` — when the next check should run
 - `running` — True while a checker thread is active for this target
@@ -106,18 +107,27 @@ _scheduler_loop() wakes every 30 s
 ```
 run_check(instance)
   fetch_leaf_cert()           TLS connect, getpeercert(binary_form=True)
+  — or —
+  fetch_leaf_cert_smtp()      SMTP STARTTLS connect (proto=smtp modules)
+
   get_aia_urls(cert)          parse AIA extension: OCSP URLs, CA Issuers URL
   get_crl_urls(cert)          parse CDP extension: CRL distribution point URLs
   build_cert_chain(cert)      walk AIA CA Issuers upward: leaf -> intermediates -> root
                               stores results in a list of x509.Certificate objects
-  if OCSP URLs exist:
+
+  if mode in (ocsp, both) and OCSP URLs exist:
     issuer = chain[1] if available, else fetch from CA Issuers URL
     for each OCSP URL:
-      check_ocsp(cert, issuer, url)
+      check_ocsp(cert, issuer, url)  -> ocsp_result
       stop on GOOD or REVOKED; retry next URL on UNREACHABLE/ERROR
-  if no definitive OCSP result:
-    check_crl(cert, crl_urls)
-  write result into _state under lock
+
+  if mode in (crl, both) and CRL URLs exist:
+    check_crl(cert, crl_urls)        -> crl_result
+    (always runs in mode=both, not just as a fallback)
+
+  pick winning result (mode=both: CRL definitive > OCSP definitive > CRL non-error > OCSP)
+  build per_method dict from ocsp_result / crl_result
+  write result and per_method into _state under lock
   call ready_event.set()
 ```
 
@@ -180,6 +190,8 @@ The scheduler thread checks every 30 seconds and re-submits any target that is p
 
 All gauges are filled from the `_state` snapshot taken under lock. No network calls happen inside `probe()`.
 
+`tls_revocation_status` emits one time series per entry in `per_method`, so in `mode=both` you get separate `method="ocsp"` and `method="crl"` rows (only for methods that were actually checked). `tls_ocsp_latency_seconds` is read from `per_method["ocsp"]` and `tls_crl_next_update_timestamp_seconds` from `per_method["crl"]`, so they are correct regardless of which method won.
+
 Chain metrics (`tls_cert_chain_not_after`, `tls_cert_chain_not_before`) are emitted by iterating `cert_info.chain` and calling `_cert_chain_labels()` on each `x509.Certificate` object. The chain is stored as live Python objects (not serialized), which is fine since `x509.Certificate` is immutable.
 
 ---
@@ -210,9 +222,13 @@ Config is read once at startup. There is no hot-reload; restart the process to p
 
 The checker thread is either still running or encountered an exception that did not set `ready`. Check logs for `[instance] check failed`. If `run_check` raises an unhandled exception before reaching the `except` block, `ready` will never be set and the probe will wait until `probe_wait_timeout`.
 
+**Only one method appears in tls_revocation_status**
+
+`per_method` only contains entries for methods that were actually run. If the certificate has no OCSP URLs, `ocsp_result` is never set and `method="ocsp"` will not appear. Check `# ocsp_urls:` and `# crl_urls:` in `?debug=1` output.
+
 **OCSP skipped, CRL used instead**
 
-The leaf certificate has an OCSP URL but no CA Issuers URL, so the issuer certificate cannot be obtained and OCSP is skipped. Look for `no CA Issuers URL; OCSP skipped` in logs. The certificate chain will contain only the leaf.
+The leaf certificate has an OCSP URL but no CA Issuers URL, so the issuer certificate cannot be obtained and OCSP is skipped. Look for `no issuer cert; OCSP skipped` in logs. The certificate chain will contain only the leaf.
 
 **CRL always re-downloaded**
 

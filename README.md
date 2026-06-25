@@ -6,12 +6,14 @@ A Prometheus exporter that performs active TLS certificate revocation checks via
 
 On the first `/probe` request for a target, the exporter:
 
-1. Opens a TLS connection and retrieves the leaf certificate.
+1. Opens a TLS connection and retrieves the leaf certificate. For `proto: smtp` modules the connection uses SMTP STARTTLS instead of a plain TLS handshake.
 2. Walks the AIA CA Issuers chain upward (leaf -> intermediates -> root) by fetching each issuer certificate from the URL embedded in the certificate's Authority Information Access extension.
-3. Sends an active OCSP request (HTTP POST, RFC 6960) to the OCSP responder URL from the same AIA extension, using SHA-256 as the hash algorithm.
-4. If OCSP is unavailable or returns a non-definitive status, falls back to downloading and parsing the CRL from the CDP extension.
-5. Stores the result and the full certificate chain in memory.
-6. Schedules the next refresh based on the result: OCSP interval, CRL next_update, or error retry interval.
+3. In `mode: both` (default), runs **both** OCSP and CRL checks independently:
+   - Sends an active OCSP request (HTTP POST, RFC 6960) to the OCSP responder URL from the AIA extension, using SHA-256 as the hash algorithm.
+   - Downloads and parses the CRL from the CDP extension.
+   - CRL is authoritative: a definitive CRL result (GOOD or REVOKED) takes priority. OCSP result is used only when CRL is unavailable or unreachable.
+4. Stores the result for each checked method and the full certificate chain in memory.
+5. Schedules the next refresh based on the result: OCSP interval, CRL next_update, or error retry interval.
 
 The `/probe` endpoint blocks until the first check completes (configurable via `probe_wait_timeout`). Subsequent requests return the cached result immediately.
 
@@ -38,7 +40,7 @@ The exporter never treats a missing or unreachable OCSP response as GOOD.
 | Metric                                  | Labels                                                              | Description                                      |
 |-----------------------------------------|---------------------------------------------------------------------|--------------------------------------------------|
 | `tls_cert_revoked`                      | instance                                                            | 1 if revoked, 0 otherwise                        |
-| `tls_revocation_status`                 | instance, method                                                    | Status code from the table above                 |
+| `tls_revocation_status`                 | instance, method                                                    | Status code per checked method (`ocsp`, `crl`)   |
 | `tls_ocsp_latency_seconds`              | instance                                                            | OCSP round-trip time                             |
 | `tls_cache_age_seconds`                 | instance                                                            | Seconds since last completed check               |
 | `tls_cert_not_after_timestamp_seconds`  | instance                                                            | Leaf certificate expiry as Unix timestamp        |
@@ -54,7 +56,7 @@ The exporter never treats a missing or unreachable OCSP response as GOOD.
 
 | Path       | Description                                      |
 |------------|--------------------------------------------------|
-| `/probe`   | Run or return cached check for `?target=host:port` or `?target=https://host` |
+| `/probe`   | Run or return cached check. Target formats: `host`, `host:port`, `host/path`, `https://host/path`. Scheme and path are stripped automatically. Default port: 443 (tcp) or 25 (smtp). |
 | `/healthz` | Returns 200 OK                                   |
 | `/targets` | Lists all registered targets with status and last check time |
 
@@ -77,10 +79,14 @@ probe_wait_timeout: 120       # how long /probe blocks waiting for the first res
 
 # Modules define check behaviour. Select via ?module=<name> in /probe requests.
 #
+# proto:
+#   tcp   — plain TLS handshake (default); default port 443
+#   smtp  — SMTP STARTTLS; default port 25 (override with host:port)
+#
 # mode:
-#   both  — OCSP primary, CRL fallback (default)
-#   ocsp  — OCSP only, no CRL fallback
-#   crl   — CRL only, no OCSP
+#   both  — CRL primary, OCSP fallback; both are always checked (default)
+#   ocsp  — OCSP only
+#   crl   — CRL only
 #
 # insecure:
 #   false — verify TLS certificate chain (default)
@@ -89,6 +95,16 @@ modules:
   default:
     mode: both
     insecure: false
+
+  smtp:
+    proto: smtp
+    mode: both
+    insecure: false
+
+  smtp_insecure:
+    proto: smtp
+    mode: both
+    insecure: true
 
 ```
 

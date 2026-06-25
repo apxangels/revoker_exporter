@@ -1,6 +1,6 @@
 services:
   revoker_exporter:
-    image: apxangels/revoker_exporter:1.0
+    image: apxangels/revoker_exporter:latest
     container_name: revoker_exporter
     ports:
       - "9969:9969"
