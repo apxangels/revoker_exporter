@@ -8,6 +8,7 @@ The /probe endpoint blocks on first check and reads from cache thereafter.
 
 import os
 import ssl
+import smtplib
 import socket
 import time
 import logging
@@ -47,6 +48,7 @@ CONFIG_PATH = os.environ.get("REVOKER_CONFIG", "revoker.yaml")
 class ModuleConfig:
     mode: str = "both"      # "ocsp" | "crl" | "both"
     insecure: bool = False
+    proto: str = "tcp"      # "tcp" | "smtp"
 
 
 @dataclass
@@ -78,6 +80,7 @@ def _parse_config(raw: dict) -> AppConfig:
         modules[name] = ModuleConfig(
             mode=str(mc.get("mode", "both")),
             insecure=bool(mc.get("insecure", False)),
+            proto=str(mc.get("proto", "tcp")),
         )
     if "default" not in modules:
         modules["default"] = ModuleConfig()
@@ -239,6 +242,28 @@ def fetch_leaf_cert(
     cert = x509.load_der_x509_certificate(der, default_backend())
     logger.debug("[%s:%s] leaf cert: %s", host, port, cert.subject.rfc4514_string())
     return cert, stapled
+
+
+def fetch_leaf_cert_smtp(host: str, port: int, insecure: bool = False) -> Tuple[x509.Certificate, bool]:
+    """Connect via SMTP STARTTLS and return (leaf_cert, False)."""
+    ctx = ssl.create_default_context()
+    if insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    c = _cfg()
+    with smtplib.SMTP(host, port, timeout=c.http_timeout) as smtp:
+        smtp.ehlo()
+        smtp.starttls(context=ctx)
+        smtp.ehlo()
+        der = smtp.sock.getpeercert(binary_form=True)
+
+    if not der:
+        raise RuntimeError("SMTP STARTTLS: server sent no certificate")
+
+    cert = x509.load_der_x509_certificate(der, default_backend())
+    logger.debug("[%s:%s] SMTP leaf cert: %s", host, port, cert.subject.rfc4514_string())
+    return cert, False
 
 
 def get_aia_urls(cert: x509.Certificate) -> Tuple[List[str], Optional[str]]:
@@ -556,13 +581,16 @@ def run_check(state_key: str) -> None:
     port = int(port_str)
 
     logger.info(
-        "[%s] starting check (module=%s mode=%s insecure=%s)",
-        instance, module_name, module.mode, module.insecure,
+        "[%s] starting check (module=%s proto=%s mode=%s insecure=%s)",
+        instance, module_name, module.proto, module.mode, module.insecure,
     )
     ready_event: Optional[threading.Event] = None
 
     try:
-        cert, stapled = fetch_leaf_cert(host, port, insecure=module.insecure)
+        if module.proto == "smtp":
+            cert, stapled = fetch_leaf_cert_smtp(host, port, insecure=module.insecure)
+        else:
+            cert, stapled = fetch_leaf_cert(host, port, insecure=module.insecure)
 
         ocsp_urls, issuer_url = get_aia_urls(cert)
         crl_urls = get_crl_urls(cert)
@@ -816,11 +844,23 @@ def probe():
         host = target
         port = 443
 
-    instance = f"{host}:{port}"
-
     c = _cfg()
     if module_name not in c.modules:
         return Response(f"unknown module {module_name!r}\n", status=400)
+
+    module = c.modules[module_name]
+    default_port = 25 if module.proto == "smtp" else 443
+
+    # Apply default port if none was specified in target
+    if target.startswith("["):
+        bracket_end = target.find("]")
+        rest = target[bracket_end + 1:] if bracket_end != -1 else ""
+        if not rest.startswith(":"):
+            port = default_port
+    elif ":" not in target:
+        port = default_port
+
+    instance = f"{host}:{port}"
 
     state_key, ready_event = _ensure_target(instance, module_name)
 
